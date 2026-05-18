@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.so
+build/
+devel/
+logs/
+.catkin_workspace
+.env
+.omc
+.claude
+*.log
