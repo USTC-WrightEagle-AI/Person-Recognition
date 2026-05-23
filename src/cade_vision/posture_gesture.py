@@ -245,7 +245,8 @@ class PostureGestureAnalyzer:
         return result
 
     def analyze_from_landmarks(self, pose_data: dict, person_id=None,
-                               hands_data: dict = None, with_temporal: bool = True) -> dict:
+                               hands_data: dict = None, with_temporal: bool = True,
+                               keypoints_3d: dict = None) -> dict:
         """
         从预计算的 landmarks 做分类 + 角度计算（不再跑模型推理）。
 
@@ -254,6 +255,7 @@ class PostureGestureAnalyzer:
             person_id:  时序挥手检测用的人物 ID（with_temporal=True 时必传）
             hands_data: process_hands() 的输出
             with_temporal: 是否跑时序挥手检测
+            keypoints_3d: {23: (x,y,z), 24: (x,y,z), ...} 深度图提取的 3D 关键点
 
         Returns:
             同 analyze() 或 analyze_with_temporal()
@@ -264,9 +266,9 @@ class PostureGestureAnalyzer:
         landmarks = pose_data["landmarks"]
         h, w = pose_data["img_h"], pose_data["img_w"]
 
-        posture, posture_conf = self._classify_posture(landmarks, h)
+        posture, posture_conf = self._classify_posture(landmarks, h, keypoints_3d)
         gesture, gesture_conf, elbow_l, elbow_r, wrist_l, wrist_r = \
-            self._classify_static_gesture(landmarks, h, w, hands_data)
+            self._classify_static_gesture(landmarks, h, w, hands_data, person_id)
 
         result = {
             "landmarks": landmarks,
@@ -401,20 +403,25 @@ class PostureGestureAnalyzer:
 
     # ==================== 姿态分类 ====================
 
-    def _classify_posture(self, landmarks, img_height):
-        """基于下肢关键点角度分类姿态（不变）"""
-        def get_landmark(idx):
+    def _classify_posture(self, landmarks, img_height, keypoints_3d: dict = None):
+        """
+        三规则姿态分类：躯干平面竖直 + 膝角 > 150° + 肩髋膝踝高差链。
+
+        keypoints_3d: {11: (x,y,z), 12: ..., 23: ..., 24: ..., 25: ..., 26: ...}
+                      None 表示无深度图，回退到旧逻辑。
+        """
+        def get_2d(idx):
             return np.array([landmarks[idx][0], landmarks[idx][1]])
 
         def is_visible(idx):
             return landmarks[idx][2] > 0.5
 
-        def leg_angle(hip_idx, knee_idx, ankle_idx):
+        def leg_angle_2d(hip_idx, knee_idx, ankle_idx):
             if not all(is_visible(i) for i in [hip_idx, knee_idx, ankle_idx]):
                 return None
-            hip = get_landmark(hip_idx)
-            knee = get_landmark(knee_idx)
-            ankle = get_landmark(ankle_idx)
+            hip = get_2d(hip_idx)
+            knee = get_2d(knee_idx)
+            ankle = get_2d(ankle_idx)
             v1 = knee - hip
             v2 = ankle - knee
             n1 = np.linalg.norm(v1)
@@ -425,28 +432,142 @@ class PostureGestureAnalyzer:
             cos_a = np.clip(cos_a, -1.0, 1.0)
             return math.degrees(math.acos(cos_a))
 
-        left_angle = leg_angle(LEFT_HIP, LEFT_KNEE, LEFT_ANKLE)
-        right_angle = leg_angle(RIGHT_HIP, RIGHT_KNEE, RIGHT_ANKLE)
+        # 若无 3D 关键点，保持原有逻辑
+        if not keypoints_3d:
+            left_angle = leg_angle_2d(LEFT_HIP, LEFT_KNEE, LEFT_ANKLE)
+            right_angle = leg_angle_2d(RIGHT_HIP, RIGHT_KNEE, RIGHT_ANKLE)
+            angles = [a for a in (left_angle, right_angle) if a is not None]
+            if not angles:
+                return "unknown", 0.0
+            avg = sum(angles) / len(angles)
+            if avg > 150:
+                return "standing", 0.8
+            elif 80 < avg < 120:
+                return "sitting", 0.8
+            elif avg < 30:
+                return "lying", 0.7
+            return "unknown", 0.3
 
-        angles = [a for a in (left_angle, right_angle) if a is not None]
-        if not angles:
-            return "unknown", 0.0
+        def kp(idx):
+            return keypoints_3d.get(idx)
 
-        avg_angle = sum(angles) / len(angles)
+        def height(idx):
+            p = kp(idx)
+            return p[1] if p is not None else None  # Y in camera coords
 
-        if avg_angle > 150:
+        # ---- 规则 1: 躯干平面竖直 (3D) ----
+        torso_ok = False
+        ls, rs, lh, rh = kp(11), kp(12), kp(23), kp(24)
+        if all(v is not None for v in (ls, rs, lh, rh)):
+            shoulder_mid = (np.array(ls) + np.array(rs)) / 2
+            hip_mid = (np.array(lh) + np.array(rh)) / 2
+            v1 = np.array(rs) - np.array(ls)         # 肩线（水平）
+            v2 = shoulder_mid - hip_mid              # 脊柱（竖直）
+            n = np.cross(v1, v2)
+            gravity = np.array([0.0, -1.0, 0.0])     # Y- 是上，重力沿 Y+
+            n_norm = np.linalg.norm(n)
+            if n_norm > 1e-6:
+                cos_theta = abs(np.dot(n, gravity)) / n_norm
+                cos_theta = np.clip(cos_theta, 0.0, 1.0)
+                theta = math.degrees(math.acos(cos_theta))
+                torso_ok = 65 <= theta <= 115
+
+        # ---- 规则 2: 任一侧膝角 > 150° ----
+        left_angle = leg_angle_2d(LEFT_HIP, LEFT_KNEE, LEFT_ANKLE)
+        right_angle = leg_angle_2d(RIGHT_HIP, RIGHT_KNEE, RIGHT_ANKLE)
+        knee_ok = False
+        knee_skip = True
+        if left_angle is not None:
+            knee_skip = False
+            if left_angle >= 150:
+                knee_ok = True
+        if right_angle is not None:
+            knee_skip = False
+            if right_angle >= 150:
+                knee_ok = True
+        # 双侧都不可见 → 跳过规则 2
+
+        # ---- 规则 3: 肩 > 髋 > 膝 > 踝 高差链 (3D) ----
+        chain_ok = False
+        chain_skip = True
+
+        def height(idx):
+            p = kp(idx)
+            return p[1] if p is not None else None  # Y in camera coords
+
+        sh = height(11) or height(12)  # shoulder
+        hi = height(23) or height(24)  # hip
+        kn = height(25) or height(26)  # knee
+        an = height(27) or height(28)  # ankle
+
+        if sh is not None and hi is not None and kn is not None and an is not None:
+            chain_skip = False
+            EPS = 0.02  # 2cm 容差
+            # Y- = up, Y+ = down → 站立时肩(−0.4) < 髋(−0.05) < 膝(+0.3) < 踝(+0.75)
+            chain_ok = (sh < hi - EPS and hi < kn - EPS and kn < an - EPS)
+
+        # ---- Sitting 判定：躯干竖直 + 脊柱 ⊥ 大腿 (3D) ----
+        sitting_ok = False
+        lk, rk = kp(25), kp(26)
+        if torso_ok and all(v is not None for v in (ls, rs, lh, rh, lk, rk)):
+            # 复用 Rule 1 的 shoulder_mid, hip_mid, spine (v2)
+            spine = v2  # shoulder_mid - hip_mid (3D)
+            knee_mid = (np.array(lk) + np.array(rk)) / 2
+            thigh = knee_mid - hip_mid  # knee → hip, 指向前下方
+            s_norm = np.linalg.norm(spine)
+            t_norm = np.linalg.norm(thigh)
+            if s_norm > 1e-6 and t_norm > 1e-6:
+                cos_angle = abs(np.dot(spine, thigh)) / (s_norm * t_norm)
+                sitting_ok = cos_angle < 0.5  # angle ∈ [60°, 120°]
+
+        if sitting_ok:
+            return "sitting", 0.85
+
+        # ---- 综合判定 ----
+        rules_passed = []
+        if torso_ok:
+            rules_passed.append("torso")
+        if knee_skip:
+            pass
+        elif knee_ok:
+            rules_passed.append("knee")
+        if chain_skip:
+            pass
+        elif chain_ok:
+            rules_passed.append("chain")
+
+        n_passed = len(rules_passed)
+        if n_passed == 0:
+            return "unknown", 0.3
+
+        if n_passed >= 2 or (torso_ok and n_passed >= 1):
+            # standing 候选 → lying 深度校验
+            if knee_ok:
+                sh_y = height(11) or height(12)
+                hi_y = height(23) or height(24)
+                kn_y = height(25) or height(26)
+                if all(v is not None for v in [sh_y, hi_y, kn_y]):
+                    spread = max(sh_y, hi_y, kn_y) - min(sh_y, hi_y, kn_y)
+                    if spread < 0.25:
+                        return "lying", 0.85
             return "standing", 0.8
-        elif 80 < avg_angle < 120:
-            return "sitting", 0.8
-        elif avg_angle < 30:
-            return "lying", 0.7
+
+        # Trigger B: standing 规则不够但膝角可见 → 可能躺着（腿伸直或蜷缩都适用）
+        if not knee_skip:
+            sh_y = height(11) or height(12)
+            hi_y = height(23) or height(24)
+            kn_y = height(25) or height(26)
+            if all(v is not None for v in [sh_y, hi_y, kn_y]):
+                spread = max(sh_y, hi_y, kn_y) - min(sh_y, hi_y, kn_y)
+                if spread < 0.25:
+                    return "lying", 0.85
 
         return "unknown", 0.3
 
     # ==================== 静态手势分类 ====================
 
     def _classify_static_gesture(self, landmarks, img_height, img_width,
-                                 hands_data: dict = None):
+                                 hands_data: dict = None, person_id=None):
         """基于上肢关键点分类静态手势，同时返回时序分析所需的角度。
         若提供 hands_data，优先用 Hands 模型的精细 wrist/index 坐标替代 Pose 的粗关键点。"""
         def get_landmark(idx):
@@ -516,39 +637,139 @@ class PostureGestureAnalyzer:
         if shoulder_dist < 1e-6:
             return "unknown", 0.0, elbow_l, elbow_r, wrist_l, wrist_r
 
-        T = shoulder_dist * 0.3
+        MARGIN = shoulder_dist * 0.2
+        T_STATIC = 50  # 度²，比 T_FOREARM(300) 低一个数量级
 
-        # 举手判断
-        left_raised = left_wrist[1] < left_shoulder[1] - T
-        right_raised = right_wrist[1] < right_shoulder[1] - T
+        # 举手判断：三规则
+        def is_arm_raised(wrist, elbow, shoulder, side):
+            """三规则举手检测。返回 (raised_bool, info_str)。"""
+            # 规则 1: 手腕接近或超过肩膀高度
+            rule1 = wrist[1] <= shoulder[1] + MARGIN
+            if not rule1:
+                return False, "rule1_fail"
 
-        # 指向判断
-        def is_pointing(wrist, elbow, shoulder):
-            arm_length = np.linalg.norm(wrist - shoulder)
-            if arm_length < 1e-6:
-                return False
-            horizontal_extent = abs(wrist[0] - shoulder[0])
-            vertical_offset = abs(wrist[1] - shoulder[1])
-            return (horizontal_extent > arm_length * 0.6 and
-                    vertical_offset < shoulder_dist * 0.5)
+            # 规则 2: 前臂竖直（肘→腕方向接近向上）
+            horiz_ok = abs(wrist[0] - elbow[0]) < shoulder_dist * 0.3
+            vert_ok = wrist[1] < elbow[1]
+            if not (horiz_ok and vert_ok):
+                return False, "rule2_fail"
 
-        left_pointing = is_pointing(left_wrist, left_elbow, left_shoulder)
-        right_pointing = is_pointing(right_wrist, right_elbow, right_shoulder)
+            # 规则 3: 15 帧内无旋转（排除挥手）
+            if person_id is not None:
+                fa_var = self.ring_buffer.get_forearm_variance(
+                    person_id, side, window=15)
+                wr_var = self.ring_buffer.get_wrist_variance(
+                    person_id, side, window=15)
+                # Hands 无数据时只检查前臂方差
+                wr_ok = (wr_var < T_STATIC) if wr_var > 0 else True
+                if fa_var >= T_STATIC or not wr_ok:
+                    return False, "rule3_fail"
+            # person_id=None → 单帧模式，跳过规则 3
+            return True, "ok"
 
-        # 分类（angle 已在上面单侧独立计算）
+        T_ARROW_Y = shoulder_dist * 0.25  # 箭身三点 y 对齐容差
+
+        # 举手检测
+        left_raised, _ = is_arm_raised(left_wrist, left_elbow, left_shoulder, "left")
+        right_raised, _ = is_arm_raised(right_wrist, right_elbow, right_shoulder, "right")
+
+        # 指向判断：三规则
+        def is_pointing(wrist, elbow, index_pose, side):
+            """
+            规则 1: 箭身水平 (elbow→wrist→index 三点 y 接近)
+            规则 2: 手指姿势 (Hands: index 伸出 + thumb/middle/ring/pinky 缩回)
+            规则 3: 15 帧静止 (方差 < T_STATIC)
+            返回 (pointing_bool, direction_str)。direction: "left"|"right"|None
+            """
+            # 规则 1: 箭身水平（elbow, wrist, index_mcp 三点 y 对齐）
+            rule1 = (abs(elbow[1] - wrist[1]) < T_ARROW_Y and
+                     abs(wrist[1] - index_pose[1]) < T_ARROW_Y)
+            if not rule1:
+                return False, None
+
+            # 规则 2: 手指姿势（需要 Hands 模型）
+            hands_ok = False
+            if hands_data:
+                hd = hands_data.get("Left" if side == "left" else "Right")
+                if hd and hd.get("landmarks"):
+                    lm = hd["landmarks"]
+                    if len(lm) >= 21:
+                        # 计算每指 TIP-MCP 距离
+                        def tip_mcp_dist(mcp_idx):
+                            tip = np.array(lm[mcp_idx + 3])  # TIP = MCP+3
+                            mcp = np.array(lm[mcp_idx])
+                            return np.linalg.norm(tip - mcp)
+                        # 参考长度：index 的 PIP-MCP × 2.5
+                        pip = np.array(lm[6])
+                        mcp = np.array(lm[5])
+                        ref_len = np.linalg.norm(pip - mcp) * 2.5
+                        if ref_len < 1e-6:
+                            ref_len = 0.1  # fallback
+
+                        index_dist = tip_mcp_dist(5)
+                        middle_dist = tip_mcp_dist(9)
+                        ring_dist = tip_mcp_dist(13)
+                        pinky_dist = tip_mcp_dist(17)
+                        thumb_dist = np.linalg.norm(
+                            np.array(lm[4]) - np.array(lm[2]))  # thumb TIP-MCP
+
+                        index_ext = index_dist > ref_len * 0.75
+                        middle_ret = middle_dist < ref_len * 0.50
+                        ring_ret = ring_dist < ref_len * 0.50
+                        pinky_ret = pinky_dist < ref_len * 0.50
+                        thumb_ret = thumb_dist < ref_len * 0.50
+
+                        # 模式 A: index伸出 + 其余缩回
+                        # 模式 B: index+middle伸出 + thumb/ring/pinky缩回
+                        pattern_a = index_ext and middle_ret and ring_ret and pinky_ret and thumb_ret
+                        pattern_b = index_ext and ring_ret and pinky_ret and thumb_ret
+                        hands_ok = pattern_a or pattern_b
+            else:
+                # 无 Hands 数据 → 规则 2 不通过
+                return False, None
+
+            if not hands_ok:
+                return False, None
+
+            # 规则 3: 15 帧静止
+            if person_id is not None:
+                fa_var = self.ring_buffer.get_forearm_variance(
+                    person_id, side, window=15)
+                wr_var = self.ring_buffer.get_wrist_variance(
+                    person_id, side, window=15)
+                wr_ok = (wr_var < T_STATIC) if wr_var > 0 else True
+                if fa_var >= T_STATIC or not wr_ok:
+                    return False, None
+
+            # 方向: elbow.x < wrist.x → pointing_right (摄像机视角)
+            direction = "right" if elbow[0] < wrist[0] else "left"
+            return True, direction
+
+        # Pose index_mcp 坐标
+        def get_index_pose(side):
+            idx = LEFT_INDEX if side == "left" else RIGHT_INDEX
+            if idx < len(landmarks) and landmarks[idx][2] > 0.3:
+                return get_landmark(idx)
+            return None
+
+        left_index = get_index_pose("left")
+        right_index = get_index_pose("right")
+
+        left_pointing, l_dir = (is_pointing(left_wrist, left_elbow, left_index, "left")
+                                if left_index else (False, None))
+        right_pointing, r_dir = (is_pointing(right_wrist, right_elbow, right_index, "right")
+                                 if right_index else (False, None))
+
+        # 分类：raising > pointing 互斥（优先级：raising 先判；waving 在 _apply_temporal 中时序覆盖）
         if left_raised and not right_raised:
             return "raising_left_arm", 0.85, elbow_l, elbow_r, wrist_l, wrist_r
         elif right_raised and not left_raised:
             return "raising_right_arm", 0.85, elbow_l, elbow_r, wrist_l, wrist_r
 
-        body_center_x = (left_shoulder[0] + right_shoulder[0]) / 2
-
         if left_pointing and not right_pointing:
-            gesture = "pointing_right" if left_wrist[0] > body_center_x else "pointing_left"
-            return gesture, 0.75, elbow_l, elbow_r, wrist_l, wrist_r
+            return f"pointing_{l_dir}", 0.75, elbow_l, elbow_r, wrist_l, wrist_r
         elif right_pointing and not left_pointing:
-            gesture = "pointing_right" if right_wrist[0] > body_center_x else "pointing_left"
-            return gesture, 0.75, elbow_l, elbow_r, wrist_l, wrist_r
+            return f"pointing_{r_dir}", 0.75, elbow_l, elbow_r, wrist_l, wrist_r
         elif left_pointing and right_pointing:
             return "pointing_both", 0.75, elbow_l, elbow_r, wrist_l, wrist_r
         elif left_raised and right_raised:

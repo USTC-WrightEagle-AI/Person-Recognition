@@ -66,6 +66,7 @@ except ImportError:
 
 
 from cade_vision.tracker import CadeTracker
+from cade_vision.cloth import associate_clothing
 
 
 class OpenVisionNode:
@@ -130,9 +131,17 @@ class OpenVisionNode:
 
         # ========== YOLO 模型加载 ==========
         self.model = None
+        self._clothing_classes = set()        # 动态累积的衣物类别
+        self._base_classes = [                # 常开的基础类别
+            "person", "t-shirt", "shirt", "sweater", "jacket", "coat",
+            "blouse", "pants", "skirt", "shorts",
+        ]
         if YOLO_AVAILABLE:
             print(f"Loading YOLO model: {args.model}")
             self.model = YOLO(args.model)
+            if hasattr(self.model, 'set_classes'):
+                self.model.set_classes(self._base_classes)
+                print(f"YOLO-World base classes: {self._base_classes}")
             print(f"YOLO model loaded")
 
         # ========== TF 初始化 ==========
@@ -304,6 +313,18 @@ class OpenVisionNode:
                     self.task_id = action
                     # 解析属性过滤（如 posture/gesture）
                     self.task_attributes = cmd.get("attributes", None)
+
+                    # 动态注入 cloth_type 到 YOLO 检测类别
+                    attrs = self.task_attributes or {}
+                    cloth_type = attrs.get("cloth_type", "")
+                    if cloth_type and cloth_type.lower() not in self._clothing_classes:
+                        self._clothing_classes.add(cloth_type.lower())
+                        if self.model and hasattr(self.model, 'set_classes'):
+                            merged = list(set(self._base_classes) | self._clothing_classes | {self.target_class})
+                            self.model.set_classes(merged)
+                            print(f"[Vision] Injected cloth class '{cloth_type}', "
+                                  f"classes now: {len(merged)}")
+
                     print(f"\n[Vision Task] {action}: target='{self.target_class}'"
                           f"  attrs={self.task_attributes}")
 
@@ -323,6 +344,16 @@ class OpenVisionNode:
                     self.task_active = True
                     self.task_id = action
                     self.task_attributes = cmd.get("attributes", None)
+
+                    # 动态注入 cloth_type
+                    attrs = self.task_attributes or {}
+                    cloth_type = attrs.get("cloth_type", "")
+                    if cloth_type and cloth_type.lower() not in self._clothing_classes:
+                        self._clothing_classes.add(cloth_type.lower())
+                        if self.model and hasattr(self.model, 'set_classes'):
+                            merged = list(set(self._base_classes) | self._clothing_classes | {category_text})
+                            self.model.set_classes(merged)
+
                     print(f"\n[Vision Task] {action}: category='{category_text}'"
                           f"  attrs={self.task_attributes}")
 
@@ -337,6 +368,24 @@ class OpenVisionNode:
                     self.task_id = action
                     threading.Thread(
                         target=self._execute_info_task,
+                        args=(cmd,),
+                        daemon=True
+                    ).start()
+
+                elif action == "get_nearest_person":
+                    self.task_active = True
+                    self.task_id = action
+                    threading.Thread(
+                        target=self._execute_nearest_person_task,
+                        args=(cmd,),
+                        daemon=True
+                    ).start()
+
+                elif action == "filter_by_attributes":
+                    self.task_active = True
+                    self.task_id = action
+                    threading.Thread(
+                        target=self._execute_filter_attrs_task,
                         args=(cmd,),
                         daemon=True
                     ).start()
@@ -441,6 +490,70 @@ class OpenVisionNode:
             ],
         }
         self._publish_status("SUCCESS", result=result)
+        self._reset_task()
+
+    def _execute_nearest_person_task(self, cmd: dict):
+        """get_nearest_person: 返回 3D 距离相机最近的人的属性"""
+        with self._lock:
+            persons = [o for o in self.detected_objects if o.get("class_name") == "person"]
+        if not persons:
+            self._publish_status("FAILED", error="No person detected")
+            self._reset_task()
+            return
+
+        # 选 3D 距离最近的人
+        nearest = None
+        min_dist = float('inf')
+        for p in persons:
+            pos = p.get("position_3d")
+            if pos is not None:
+                d = math.sqrt(pos[0]**2 + pos[1]**2 + pos[2]**2)
+                if d < min_dist:
+                    min_dist, nearest = d, p
+        if nearest is None:
+            nearest = persons[0]  # 回退：取第一个
+
+        attr = {
+            "cloth_color": nearest.get("cloth_color", "unknown"),
+            "cloth_type": nearest.get("cloth_type", "unknown"),
+            "hair_color": "unknown",
+            "has_glasses": False,
+            "height": "unknown",
+            "position_3d": nearest.get("position_3d"),
+        }
+        self._publish_status("SUCCESS", result=attr)
+        self._reset_task()
+
+    def _execute_filter_attrs_task(self, cmd: dict):
+        """filter_by_attributes: 匹配所有指定属性的人"""
+        with self._lock:
+            persons = [o for o in self.detected_objects if o.get("class_name") == "person"]
+
+        matched = []
+        for p in persons:
+            ok = True
+            for key, val in cmd.items():
+                if key in ("action", "timeout"):
+                    continue
+                if val is None or val == "unknown":
+                    continue
+                p_val = p.get(key)
+                if p_val is None or str(p_val).lower() != str(val).lower():
+                    ok = False
+                    break
+            if ok:
+                matched.append({
+                    "track_id": p.get("track_id"),
+                    "bbox": list(p.get("bbox", [])),
+                    "position_3d": p.get("position_3d"),
+                    "cloth_color": p.get("cloth_color", "unknown"),
+                    "cloth_type": p.get("cloth_type", "unknown"),
+                    "hair_color": "unknown",
+                    "has_glasses": False,
+                    "height": "unknown",
+                })
+
+        self._publish_status("SUCCESS", result={"persons": matched, "count": len(matched)})
         self._reset_task()
 
     def _reset_task(self):
@@ -676,6 +789,9 @@ class OpenVisionNode:
             for obj, tid in zip(new_detections, track_ids):
                 obj["track_id"] = tid
 
+            # 衣物关联：将衣服框 IOU 匹配到人，提取颜色 + 类型
+            associate_clothing(new_detections, color_image)
+
             # [MediaPipe] Pose + Hands 并行后处理（线程池，一次融合，无回退）
             if self.posture_gesture is not None:
                 for obj in new_detections:
@@ -685,7 +801,7 @@ class OpenVisionNode:
                         if person_crop.size > 0:
                             pid = obj["track_id"]
 
-                            # Pose + Hands 并行推理，等双方都完成后再融合
+                            # Pose + Hands 并行推理
                             fut_pose = self._pool.submit(
                                 self.posture_gesture.process_pose, person_crop)
                             fut_hands = self._pool.submit(
@@ -693,9 +809,25 @@ class OpenVisionNode:
                             pose_data = fut_pose.result()
                             hands_data = fut_hands.result()
 
+                            # 从深度图提取关键点 3D 坐标（肩髋膝踝，供 posture 规则用）
+                            keypoints_3d = {}
+                            if (depth_frame is not None and pose_data is not None
+                                    and is_realsense):
+                                lm = pose_data["landmarks"]
+                                for idx in [11, 12, 23, 24, 25, 26, 27, 28]:
+                                    if lm[idx][2] < 0.5:
+                                        continue
+                                    px = int(lm[idx][0] * (x2 - x1) + x1)
+                                    py = int(lm[idx][1] * (y2 - y1) + y1)
+                                    pt = self.get_3d_coordinates(
+                                        depth_frame, px, py)
+                                    if pt is not None:
+                                        keypoints_3d[idx] = pt
+
                             pg_result = self.posture_gesture.analyze_from_landmarks(
                                 pose_data, person_id=pid, hands_data=hands_data,
-                                with_temporal=True)
+                                with_temporal=True,
+                                keypoints_3d=keypoints_3d if keypoints_3d else None)
 
                             obj["posture"] = pg_result.get("posture", "unknown")
                             obj["gesture"] = pg_result.get("gesture", "unknown")
